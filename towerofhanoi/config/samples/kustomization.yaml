@@ -1,4 +1,0 @@
-## Append samples of your project ##
-resources:
-- webapp_v1alpha1_towerchallenge.yaml
-#+kubebuilder:scaffold:manifestskustomizesamples

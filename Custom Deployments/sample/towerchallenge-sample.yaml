@@ -1,6 +1,0 @@
-apiVersion: hanoi.com/v1alpha1
-kind: TowerChallenge
-metadata:
-  name: towerchallenge-sample
-spec:
-  numDisks: 3

@@ -1,0 +1,9 @@
+apiVersion: hanoi.mosesking.github.io/v1alpha1
+kind: TowerChallenge
+metadata:
+  labels:
+    app.kubernetes.io/name: hanoi-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: towerchallenge-sample
+spec:
+  discs: 4

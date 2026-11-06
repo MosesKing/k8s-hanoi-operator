@@ -1,252 +1,101 @@
-# Tower of Hanoi Challenge Project
+# k8s-hanoi-operator
 
-## Prerequisites
+[![Tests](https://github.com/MosesKing/k8s-hanoi-operator/actions/workflows/test.yml/badge.svg)](https://github.com/MosesKing/k8s-hanoi-operator/actions/workflows/test.yml)
+[![E2E Tests](https://github.com/MosesKing/k8s-hanoi-operator/actions/workflows/test-e2e.yml/badge.svg)](https://github.com/MosesKing/k8s-hanoi-operator/actions/workflows/test-e2e.yml)
+[![Lint](https://github.com/MosesKing/k8s-hanoi-operator/actions/workflows/lint.yml/badge.svg)](https://github.com/MosesKing/k8s-hanoi-operator/actions/workflows/lint.yml)
 
-1. Kubernetes Cluster - A cluster where Crossplane and the custom operator will be deployed.
-2. Install Crossplane - Install Crossplane on your Kubernetes cluster.
-3. Kubebuilder - tool to scaffold out the operator.
+A Kubernetes operator, written in Go with [Kubebuilder](https://book.kubebuilder.io), that solves the Tower of Hanoi. You declare a `TowerChallenge` with a number of discs; the operator writes the solution into the cluster as one ConfigMap per move and keeps it in sync.
 
-## Cluster Creation & Setup
+The puzzle is a toy. The point is the operator pattern done properly: a declarative API with validation, an idempotent reconcile loop, owner references and garbage collection, self-healing, status conditions, least-privilege RBAC, and tests at three levels.
 
-1. Create our Kubernetes Cluster
+*Opérateur Kubernetes en Go (Kubebuilder) : une ressource `TowerChallenge` décrit le puzzle, l'opérateur écrit la solution en ConfigMaps et la garde synchronisée. Validé par des tests unitaires, des tests contre un vrai API server (envtest) et des tests de bout en bout sur un cluster kind.*
+
+```console
+$ kubectl apply -f config/samples/hanoi_v1alpha1_towerchallenge.yaml
+towerchallenge.hanoi.mosesking.github.io/towerchallenge-sample created
+
+$ kubectl get tc
+NAME                    DISCS   MOVES   PHASE    AGE
+towerchallenge-sample   4       15      Solved   3s
+
+$ kubectl get cm -l hanoi.mosesking.github.io/challenge=towerchallenge-sample -o custom-columns=NAME:.metadata.name,MOVE:.data.move
+NAME                              MOVE
+towerchallenge-sample-move-0001   Move disc 1 from A to B
+towerchallenge-sample-move-0002   Move disc 2 from A to C
+towerchallenge-sample-move-0003   Move disc 1 from B to C
+...
+towerchallenge-sample-move-0015   Move disc 1 from B to C
+```
+
+## How it works
+
+```mermaid
+flowchart LR
+    U[kubectl apply<br/>TowerChallenge] --> API[(Kubernetes API)]
+    API -- spec changed --> R[Reconcile]
+    R --> S[Solve n discs<br/>2^n − 1 moves]
+    S --> A[Create or update<br/>one ConfigMap per move]
+    A --> D[Delete moves that are<br/>no longer in the solution]
+    D --> ST[Update status<br/>Solved · Ready=True]
+    CM[ConfigMap deleted<br/>or edited] -- owned object changed --> R
+```
+
+On every pass the reconciler compares the cluster with the solution for `spec.discs` and fixes the difference:
+
+| Event | What the operator does |
+|---|---|
+| Challenge created | Writes `2^n − 1` ConfigMaps, sets `status.phase: Solved` and `Ready=True` |
+| `discs` lowered (4 → 3) | Deletes moves 8 to 15, keeps 1 to 7 untouched |
+| `discs` raised (3 → 5) | Adds the missing moves, rewrites the ones that changed |
+| A move is deleted or edited by hand | Puts it back exactly as it was |
+| Challenge deleted | Nothing to do: every ConfigMap has an owner reference, so Kubernetes garbage-collects them |
+| Nothing changed | Nothing is written. A second pass never touches the API (tested) |
+
+## Design decisions
+
+- **The API validates input, not the controller.** `discs` must be between 1 and 10 (`+kubebuilder:validation` markers in the CRD). 10 discs is already 1,023 ConfigMaps, so the cap protects the cluster.
+- **Owner references instead of finalizers.** Every move is controlled by its challenge. Deleting the challenge cleans up through the garbage collector, with no custom cleanup code to get wrong.
+- **Idempotent and level-triggered.** Reconcile uses `CreateOrUpdate` and only writes when something differs, so it can run any number of times. Status is only updated when the result changes.
+- **Watches what it owns.** The controller reacts to spec changes on challenges (`GenerationChangedPredicate`, so status updates do not loop) and to any change on its own ConfigMaps, which is what makes it self-healing.
+- **Never deletes what it does not own.** A ConfigMap that carries the label but not the owner reference is left alone (tested).
+- **Least privilege.** The controller can read challenges and write their status, and manage ConfigMaps. Nothing else.
+- **Readable output.** ConfigMap names are zero-padded (`-move-0001`), so `kubectl get` lists them in order.
+
+## Tests
+
+| Level | What | Where |
+|---|---|---|
+| Unit | The solver replays every solution from 1 to 12 discs on three rods and checks the rules: only the top disc moves, never onto a smaller disc, all discs end on C, in exactly `2^n − 1` moves | [`internal/hanoi`](internal/hanoi/solve_test.go) |
+| Controller (envtest, real API server) | Writes owned ConfigMaps and `Ready=True` · second pass changes nothing · resize down and up · repairs a deleted and an edited move · leaves foreign ConfigMaps alone · CRD rejects 0, negative and 11 discs | [`internal/controller`](internal/controller/towerchallenge_controller_test.go) |
+| End to end (kind cluster) | Builds the image, deploys the operator, checks the metrics endpoint, then: solve 4 discs → shrink to 3 → delete a move and watch it come back → delete the challenge and watch the garbage collector remove every move | [`test/e2e`](test/e2e/e2e_test.go) |
+
+All three run in GitHub Actions on every push, with `golangci-lint`.
+
+## Run it
+
+Requirements: Go 1.26, Docker, [kind](https://kind.sigs.k8s.io), kubectl.
 
 ```bash
-kind create cluster --name <desiredclustername>
+make test        # unit + controller tests (downloads envtest binaries)
+make lint        # golangci-lint
+make test-e2e    # creates a kind cluster, deploys, runs the scenario, deletes the cluster
 ```
 
-2. Install Crossplane
+Try it by hand on a local cluster:
 
 ```bash
-kubectl create namespace crossplane-system
-helm repo add crossplane-stable https://charts.crossplane.io/stable
-helm repo update
-helm install crossplane --namespace crossplane-system crossplane-stable/crossplane
-```
-- For the sake of this project my cluster was locally on my machine however, if we wanted to we could configure crossplane with various cloud providers, AWS, GCP, Azure. T
-3. Install Kubebuilder
-
-```bash
-curl -L -o kubebuilder "https://go.kubebuilder.io/dl/latest/$(go env GOOS)/$(go env GOARCH)"\nchmod +x kubebuilder && sudo mv kubebuilder /usr/local/bin/
+kind create cluster
+make docker-build IMG=hanoi-operator:dev
+kind load docker-image hanoi-operator:dev
+make install deploy IMG=hanoi-operator:dev
+kubectl apply -f config/samples/hanoi_v1alpha1_towerchallenge.yaml
+kubectl get tc -w
 ```
 
-## Scaffold Our Project
+## Project history
 
-Let's get started on building project directory and get all of the files in the correct order, for this we will setup a new directory, and from inside the directory we will execute the kubebuilder commands
+I first built this in 2024 as a platform engineering take-home on Kubernetes and Crossplane. That version worked on my cluster but had real bugs: the API was declared cluster-scoped while the controller wrote into a namespace, the only test could never pass, nothing linked the ConfigMaps to their challenge, and there was no limit on discs. In 2026 I rebuilt it on current Kubebuilder (controller-runtime 0.25, Kubernetes 1.37 client libraries), fixed those issues and added the test suite above.
 
-```bash
-mkdir tower-operator
-cd tower-operator
-kubebuilder init --domain hanoi.com --repo hanoi.com/tower-operator
-```
+## License
 
-### Define our CRD
-
-```bash
-kubebuilder create api --group webapp --version v1alpha1 --kind TowerChallenge
-```
-
-- Please select `y` to both questions. Thank you !
-
-This above command generates a CRD and controller, that we can modify the API spec to include our number of discs. You should see a result that looks something like below:
-
-```go
-// TowerChallengeSpec defines the desired state of TowerChallenge
-type TowerChallengeSpec struct {
-	// Discs is the number of discs in the Tower of Hanoi challenge
-	// +kubebuilder:validation:Minimum=1
-	Discs int `json:"discs"` // This is what we will add, it won't be there from running the command above. :p
-}
-```
-
-The following code in the towerchallenge_types.go file will make our controller compute the Tower of Hanoi solution and create corresponding ConfigMaps for each move.
-
-### Insight
-
-## Apply our CRD:
-
-```bash
-kubectl create ns tower-challenge
-kubectl apply -f config/crd/bases/
-```
-
-
-## Apply our RBAC
-```bash
-kubectl apply -f 
-```
-## Deploy Our Operator onto the Cluster:
-
-Run the next command to deploy and build the operator.
-
-```bash
-make install
-make run
-```
-
-### Output (Terminal):
-
-```bash
-go fmt ./...
-go vet ./...
-go run ./cmd/main.go
-2024-04-24T12:21:14-07:00       INFO    setup   starting manager
-2024-04-24T12:21:14-07:00       INFO    starting server {"kind": "health probe", "addr": "[::]:8081"}
-2024-04-24T12:21:14-07:00       INFO    controller-runtime.metrics      Starting metrics server
-2024-04-24T12:21:14-07:00       INFO    controller-runtime.metrics      Serving metrics server  {"bindAddress": ":8080", "secure": false}
-2024-04-24T12:21:14-07:00       INFO    Starting EventSource    {"controller": "towerchallenge", "controllerGroup": "hanoi.hanoi.com", "controllerKind": "TowerChallenge", "source": "kind source: *v1alpha1.TowerChallenge"}
-2024-04-24T12:21:14-07:00       INFO    Starting EventSource    {"controller": "towerchallenge", "controllerGroup": "hanoi.hanoi.com", "controllerKind": "TowerChallenge", "source": "kind source: *v1.ConfigMap"}
-2024-04-24T12:21:14-07:00       INFO    Starting Controller     {"controller": "towerchallenge", "controllerGroup": "hanoi.hanoi.com", "controllerKind": "TowerChallenge"}
-2024-04-24T12:21:14-07:00       INFO    Starting workers        {"controller": "towerchallenge", "controllerGroup": "hanoi.hanoi.com", "controllerKind": "TowerChallenge", "worker count": 1}
-
-```
-
-## Result:
-
-I have written a custom operator that leverages Crossplane Resources Definitions and Compositions and Composition Resources and Claims to generate config maps after calculating the number of moves to solve the Hanoi Tower puzzle problem. For every disc moved it generates a config maps like the ones in the image below on my local cluster.
-
-![Config Maps Generated](image-1.png)
-![ConfigMap Detailed](image-2.png)
-
-### TowerSamples: 
-
-From this point, I have also had it create a Composition Resource Definition called TowerSamples to record the process of how long it took to produce the ConfigMaps the names of all the configmaps generated, and a clean up of configmaps in the case that the claim defines for the system to reduce the number of discs. I have made sure that it would calculate the number of config maps and generate them only the ones needed and update the messages of disc moved or reduce the ones that would give us a wrong solution.
-
-```yaml
-apiVersion: webapp.hanoi.com/v1alpha1
-kind: TowerChallenge
-metadata:
-  annotations:
-    kubectl.kubernetes.io/last-applied-configuration: >
-      {"apiVersion":"webapp.hanoi.com/v1alpha1","kind":"TowerChallenge","metadata":{"annotations":{},"labels":{"app.kubernetes.io/managed-by":"kustomize","app.kubernetes.io/name":"towerofhanoi"},"name":"towerchallenge-sample","namespace":"tower-challenge"},"spec":{"discs":4}}
-  creationTimestamp: "2024-04-21T18:38:01Z"
-  generation: 6
-  labels:
-    app.kubernetes.io/managed-by: kustomize
-    app.kubernetes.io/name: towerofhanoi
-  managedFields:
-    - apiVersion: webapp.hanoi.com/v1alpha1
-      fieldsType: FieldsV1
-      fieldsV1:
-        f:metadata:
-          f:annotations:
-            .: {}
-            f:kubectl.kubernetes.io/last-applied-configuration: {}
-          f:labels:
-            .: {}
-            f:app.kubernetes.io/managed-by: {}
-            f:app.kubernetes.io/name: {}
-        f:spec:
-          .: {}
-          f:discs: {}
-      manager: kubectl-client-side-apply
-      operation: Update
-      time: "2024-04-22T06:30:21Z"
-    - apiVersion: webapp.hanoi.com/v1alpha1
-      fieldsType: FieldsV1
-      fieldsV1:
-        f:status:
-          .: {}
-          f:configMapsCreated: {}
-          f:phase: {}
-      manager: main
-      operation: Update
-      subresource: status
-      time: "2024-04-22T09:40:00Z"
-    - apiVersion: webapp.hanoi.com/v1alpha1
-      fieldsType: FieldsV1
-      fieldsV1:
-        f:status:
-          f:configMapNames: {}
-          f:endTime: {}
-          f:startTime: {}
-          f:steps: {}
-      manager: manager
-      operation: Update
-      subresource: status
-      time: "2024-04-24T12:19:03Z"
-  name: towerchallenge-sample
-  namespace: tower-challenge
-  resourceVersion: "644040"
-  uid: 71f0ad7f-56d1-4c42-961e-60cdcda95380
-  selfLink: >-
-    /apis/webapp.hanoi.com/v1alpha1/namespaces/tower-challenge/towerchallenges/towerchallenge-sample
-status:
-  configMapNames:
-    - towerchallenge-sample-move-1
-    - towerchallenge-sample-move-2
-    - towerchallenge-sample-move-3
-    - towerchallenge-sample-move-4
-    - towerchallenge-sample-move-5
-    - towerchallenge-sample-move-6
-    - towerchallenge-sample-move-7
-    - towerchallenge-sample-move-8
-    - towerchallenge-sample-move-9
-    - towerchallenge-sample-move-10
-    - towerchallenge-sample-move-11
-    - towerchallenge-sample-move-12
-    - towerchallenge-sample-move-13
-    - towerchallenge-sample-move-14
-    - towerchallenge-sample-move-15
-  configMapsCreated: true
-  endTime: "2024-04-24T12:19:03Z"
-  phase: Completed
-  startTime: "2024-04-24T12:19:03Z"
-  steps:
-    - Move disk 1 from A to B
-    - Move disk 2 from A to C
-    - Move disk 1 from B to C
-    - Move disk 3 from A to B
-    - Move disk 1 from C to A
-    - Move disk 2 from C to B
-    - Move disk 1 from A to B
-    - Move disk 4 from A to C
-    - Move disk 1 from B to C
-    - Move disk 2 from B to A
-    - Move disk 1 from C to A
-    - Move disk 3 from B to C
-    - Move disk 1 from A to B
-    - Move disk 2 from A to C
-    - Move disk 1 from B to C
-spec:
-  discs: 4
-```
-## Image Packaged: 
- moefromthemo/tower-challenge-operator:v1.3 - using DockerHub 
-
-# Why Did I Use a Custom Operator over Composition Functions:
-
-- State Management Efficiency: A custom operator can maintain internal state and manage transitions between states more efficiently than composition functions, which are stateless. For algorithms like Tower of Hanoi that require stateful logic to track the sequence of moves, an operator's ability to hold state can result in faster execution and less complexity in managing dependent states.
-- Tailored Event Handling: Custom operators can be designed to respond to specific events in a more optimized and immediate manner. For the Tower of Hanoi, an operator can watch for changes in the cluster that directly impact the game's progress and react in real-time, while a composition function is limited to the reactive model defined by Crossplane, potentially leading to latency or missed optimizations.
-- Custom Resource Lifecycle Management: Operators are purpose-built to handle the full lifecycle of their custom resources, including complex cleanup logic that may be required when resources are updated or deleted. In the Tower of Hanoi challenge, a custom operator could effectively manage the creation and deletion of ConfigMaps or other resources that represent each move, ensuring that all resources are in sync with the game's state. This can be especially important in cleanup scenarios, where the operator can ensure that all associated resources are appropriately handled without leaving orphaned objects or inconsistent states.
-
-# Challenge 2:
-
-## My Propose Designed
-
-I'm not sure if this would work, but from what I've learned from consulting documentation and various technical blogs (https://vrelevant.net/crossplane-beyond-the-basics-nested-xrs-and-composition-selectors/). I think we could potentially do something like this. 
-
-### Composition Hierarchy
-
-1. Composite Resource Definitions (XRDs) and Initial Setup
-
-    Tower Challenge XR (Top-level XR): Define an XRD for the top-level game state. This XR will manage the entire game, including tracking the number of discs and the state of each rod (A, B, C). It will also hold metadata about the current number of moves and the minimum moves calculated based on the number of discs.
-
-    Move Disc XR (Nested XR): Each move in the game can be represented as a nested XR. These XRs will manage individual moves and will be instantiated by the game state XR whenever a move needs to be computed.
-
-2. Composition Design for Nested Resources
-
-    Main Game Composition: The main composition attached to the game state XR will orchestrate the overall game setup and initiate the first move. This composition includes logic to calculate the minimum number of moves and set up the initial configuration of the discs across the rods.
-
-    Move Composition: A separate composition for the move XR will manage the logic to determine the source and destination rods for each disc movement. This composition will read the current state from the game state XR and decide the next move based on the Tower of Hanoi algorithm. After each move, this composition will update the game state XR with the new configuration.
-
-3. Using Composition Selectors
-
-    Dynamic Strategy Adaptation: Employ composition selectors within the game state XR to dynamically choose different move compositions based on the current state or specific rules (e.g., solving the puzzle with the least number of moves possible or using different strategies like recursive vs iterative approaches).
-
-    Selector Based on Game Progress: Use selectors to switch compositions when the game reaches specific thresholds or conditions, such as when only a few moves are left or if a different strategic approach becomes necessary due to errors or specific game conditions.
-
-## Additional Notes:
-
-- This challenge was complicated but I found myself enjoying such new technology,
-- I'm so curious as to where the best documentation is written because I reviewed quite literally everything I could grab my hands on. When I first gave my proposed solution containing a custom operator that I built, I recieved an email about using the composition function, and I spent the next couple of days trying to find a way to implement this solution, but finally in all of my studies of crossplane so far I'm left with an understanding that although composition functions are incredibly powerful and allow us to make a level of dynamicness before, it's not ideal for complicated calculations like the Puzzle presented here, and would scale was give us a lot of overhead and complexity comparatively.
-- I feel strong about defending my solution and even stronger about learning how I could best implement composition functions at Swisscom.
+Apache 2.0
